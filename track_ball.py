@@ -15,9 +15,15 @@ from typing import Literal
 import cv2
 import numpy as np
 
-from calibration import FieldCalibration
+from calibration import FieldCalibration, load_calibration, save_calibration
+from calibration_ui import run_calibration_ui
 from frame_source import open_frame_source
-from spatial_filter import classify_point, scale_point_to_pixels, scaled_polygons
+from spatial_filter import (
+    classify_point,
+    resize_ignore_mask,
+    scale_point_to_pixels,
+    scaled_polygons,
+)
 
 WIN_LIVE = "Ball Tracker"
 WIN_FG = "Foreground"
@@ -235,7 +241,24 @@ def parse_args():
         action="store_true",
         help="Hide debug windows for maximum FPS.",
     )
-return p.parse_args()
+    p.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="Load saved calibration JSON (skip interactive UI).",
+    )
+    p.add_argument(
+        "--save-calibration",
+        type=Path,
+        default=None,
+        help="Save calibration to this JSON path after interactive setup.",
+    )
+    p.add_argument(
+        "--skip-calibration",
+        action="store_true",
+        help="Run without spatial calibration (legacy behavior).",
+    )
+    return p.parse_args()
 
 
 def color_window_title(target: ColorTarget) -> str:
@@ -315,6 +338,22 @@ def main():
         )
 
     cal: FieldCalibration | None = None
+    if args.skip_calibration:
+        cal = None
+    elif args.calibration is not None:
+        cal = load_calibration(args.calibration)
+    else:
+        first = frame_source.read()
+        if first is None:
+            frame_source.release()
+            raise SystemExit("Could not read first frame for calibration.")
+        cal = run_calibration_ui(first)
+        if cal is None:
+            frame_source.release()
+            raise SystemExit("Calibration cancelled.")
+        if args.save_calibration is not None:
+            save_calibration(cal, args.save_calibration)
+            print(f"Saved calibration to {args.save_calibration}")
 
     tracker = BallTracker(
         process_scale=process_scale,
@@ -324,6 +363,12 @@ def main():
         density_radius=args.density_radius,
         color_target=args.color,
     )
+
+    if cal is not None:
+        proc_h = int(cal.frame_height * process_scale)
+        proc_w = int(cal.frame_width * process_scale)
+        ignore_proc = resize_ignore_mask(cal.ignore_mask, (proc_w, proc_h))
+        tracker.set_ignore_mask_proc(ignore_proc)
 
     show_debug = not args.no_debug
     frame_count = 0
