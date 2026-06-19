@@ -1,4 +1,4 @@
-"""Ball tracker: bg subtract + white filter + density peak (red dot).
+"""Ball tracker: bg subtract + color filter + density peak (red dot).
 
 Performance: process at reduced resolution, display at capture resolution.
 Debug panels open in separate windows (toggle with d).
@@ -9,13 +9,19 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
 
+from frame_source import open_frame_source
+
 WIN_LIVE = "Ball Tracker"
 WIN_FG = "Foreground"
-WIN_WHITE = "White Filter"
+WIN_COLOR = "Color Filter"
+
+ColorTarget = Literal["white", "yellow"]
 
 RESOLUTION_PRESETS = {
     "1080": {"width": 1920, "height": 1080, "process_scale": 0.5, "live_win": (960, 540)},
@@ -23,12 +29,15 @@ RESOLUTION_PRESETS = {
 }
 
 
+
 @dataclass
 class TrackResult:
     density_peak: tuple[int, int] | None  # full-frame coords
     density_peak_proc: tuple[int, int] | None = None  # process-resolution coords
     foreground: np.ndarray | None = None
-    white_fg: np.ndarray | None = None
+    color_fg: np.ndarray | None = None
+    rejected_by_ignore: bool = False
+    raw_peak_proc: tuple[int, int] | None = None
 
 
 class BallTracker:
@@ -40,6 +49,12 @@ class BallTracker:
         white_threshold: int = 140,
         max_saturation: int = 100,
         density_radius: int = 12,
+        color_target: ColorTarget = "white",
+        yellow_hue_low: int = 18,
+        yellow_hue_high: int = 38,
+        yellow_min_sat: int = 80,
+        yellow_min_val: int = 140,
+        ignore_mask_proc: np.ndarray | None = None,
     ) -> None:
         self.process_scale = process_scale
         self.warmup_frames = warmup_frames
@@ -47,6 +62,12 @@ class BallTracker:
         self.white_threshold = white_threshold
         self.max_saturation = max_saturation
         self.density_radius = density_radius
+        self.color_target = color_target
+        self.yellow_hue_low = yellow_hue_low
+        self.yellow_hue_high = yellow_hue_high
+        self.yellow_min_sat = yellow_min_sat
+        self.yellow_min_val = yellow_min_val
+        self.ignore_mask_proc = ignore_mask_proc
 
         self._bg: np.ndarray | None = None
         self._warmup_stack: list[np.ndarray] = []
@@ -67,6 +88,9 @@ class BallTracker:
         self._bg = None
         self._warmup_stack = []
         self._proc_size = None
+
+    def set_ignore_mask_proc(self, mask: np.ndarray | None) -> None:
+        self.ignore_mask_proc = mask
 
     def _to_process(self, frame: np.ndarray) -> np.ndarray:
         if self.process_scale == 1.0:
@@ -92,16 +116,33 @@ class BallTracker:
         h, w = self._bg.shape[:2]
         self._proc_size = (w, h)
 
-    def _density_peak(self, white_mask: np.ndarray) -> tuple[int, int] | None:
-        if not cv2.countNonZero(white_mask):
+    def _density_peak(self, color_mask: np.ndarray) -> tuple[int, int] | None:
+        if not cv2.countNonZero(color_mask):
             return None
         ksize = self.density_radius * 2 + 1
         # boxFilter counts neighbors — ~14x faster than float32 filter2D at 1080p.
         density = cv2.boxFilter(
-            white_mask, cv2.CV_32F, (ksize, ksize), normalize=False
+            color_mask, cv2.CV_32F, (ksize, ksize), normalize=False
         )
         _, _, _, max_loc = cv2.minMaxLoc(density)
         return int(max_loc[0]), int(max_loc[1])
+
+    def _color_mask(self, hsv: np.ndarray) -> np.ndarray:
+        if self.color_target == "yellow":
+            return cv2.inRange(
+                hsv,
+                (self.yellow_hue_low, self.yellow_min_sat, self.yellow_min_val),
+                (self.yellow_hue_high, 255, 255),
+            )
+        return cv2.inRange(
+            hsv,
+            (0, 0, self.white_threshold),
+            (180, self.max_saturation, 255),
+        )
+
+    def toggle_color_target(self) -> ColorTarget:
+        self.color_target = "yellow" if self.color_target == "white" else "white"
+        return self.color_target
 
     def process(self, frame: np.ndarray, *, debug: bool = False) -> TrackResult | None:
         small = self._to_process(frame)
@@ -120,27 +161,33 @@ class BallTracker:
         fg_mask = cv2.morphologyEx(fg_mask.astype(np.uint8), cv2.MORPH_OPEN, self._noise_kernel)
 
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(
-            hsv,
-            (0, 0, self.white_threshold),
-            (180, self.max_saturation, 255),
-        )
-        white_mask = cv2.bitwise_and(white_mask, fg_mask)
+        color_mask = self._color_mask(hsv)
+        color_mask = cv2.bitwise_and(color_mask, fg_mask)
 
-        peak_small = self._density_peak(white_mask)
+        peak_small = self._density_peak(color_mask)
+        raw_peak_small = peak_small
+        rejected = False
+        if peak_small and self.ignore_mask_proc is not None:
+            px, py = peak_small
+            h, w = self.ignore_mask_proc.shape[:2]
+            if 0 <= px < w and 0 <= py < h and self.ignore_mask_proc[py, px] > 0:
+                peak_small = None
+                rejected = True
         peak_full = self._to_full(*peak_small) if peak_small else None
 
         foreground = None
-        white_fg = None
+        color_fg = None
         if debug:
             foreground = cv2.bitwise_and(small, small, mask=fg_mask)
-            white_fg = cv2.bitwise_and(small, small, mask=white_mask)
+            color_fg = cv2.bitwise_and(small, small, mask=color_mask)
 
         return TrackResult(
             density_peak=peak_full,
             density_peak_proc=peak_small,
             foreground=foreground,
-            white_fg=white_fg,
+            color_fg=color_fg,
+            rejected_by_ignore=rejected,
+            raw_peak_proc=raw_peak_small,
         )
 
 
@@ -150,19 +197,20 @@ def open_window(name: str, width: int, height: int, x: int, y: int) -> None:
     cv2.moveWindow(name, x, y)
 
 
-def setup_capture(source: str | int, width: int, height: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise SystemExit(f"Could not open: {source}")
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    return cap
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Fast density-based ball tracker.")
-    p.add_argument("--device", default="/dev/video42")
+    p.add_argument(
+        "--source",
+        default="/dev/video42",
+        help="Live device or video file path",
+    )
+    p.add_argument("--device", default=None, help="Deprecated: use --source")
+    p.add_argument(
+        "--color",
+        choices=("white", "yellow"),
+        default="white",
+        help="Color target for ball detection (toggle at runtime with c).",
+    )
     p.add_argument("--threshold", type=int, default=25)
     p.add_argument("--white", type=int, default=140)
     p.add_argument("--saturation", type=int, default=100)
@@ -184,7 +232,25 @@ def parse_args():
         action="store_true",
         help="Hide debug windows for maximum FPS.",
     )
-    return p.parse_args()
+return p.parse_args()
+
+
+def color_window_title(target: ColorTarget) -> str:
+    label = "White" if target == "white" else "Yellow"
+    return f"Color Filter ({label})"
+
+
+def draw_color_panel_label(img: np.ndarray, target: ColorTarget) -> None:
+    label = "WHITE" if target == "white" else "YELLOW"
+    cv2.putText(
+        img,
+        f"Target: {label}  (c=toggle)",
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        2,
+    )
 
 
 def draw_dot(img: np.ndarray, pt: tuple[int, int] | None) -> None:
@@ -196,19 +262,32 @@ def draw_dot(img: np.ndarray, pt: tuple[int, int] | None) -> None:
 
 def main():
     args = parse_args()
-    source = int(args.device) if str(args.device).isdigit() else args.device
+    source_str = args.device or args.source
+    is_file = Path(source_str).is_file()
     preset = RESOLUTION_PRESETS[args.resolution]
-    process_scale = (
-        args.process_scale if args.process_scale is not None else preset["process_scale"]
-    )
 
-    cap = setup_capture(source, preset["width"], preset["height"])
+    if is_file:
+        process_scale = (
+            args.process_scale if args.process_scale is not None else 1.0
+        )
+        frame_source = open_frame_source(source_str)
+    else:
+        process_scale = (
+            args.process_scale
+            if args.process_scale is not None
+            else preset["process_scale"]
+        )
+        frame_source = open_frame_source(
+            source_str, preset["width"], preset["height"]
+        )
+
     tracker = BallTracker(
         process_scale=process_scale,
         diff_threshold=args.threshold,
         white_threshold=args.white,
         max_saturation=args.saturation,
         density_radius=args.density_radius,
+        color_target=args.color,
     )
 
     show_debug = not args.no_debug
@@ -216,32 +295,43 @@ def main():
     t0 = time.perf_counter()
     size_warned = False
 
-    live_w, live_h = preset["live_win"]
+    if is_file:
+        live_w, live_h = 960, 540
+    else:
+        live_w, live_h = preset["live_win"]
     dbg_w, dbg_h = live_w // 2, live_h // 2
     open_window(WIN_LIVE, live_w, live_h, 80, 80)
     if show_debug:
         open_window(WIN_FG, dbg_w, dbg_h, 80, live_h + 100)
-        open_window(WIN_WHITE, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+        open_window(WIN_COLOR, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+        cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
 
-    print("Red dot = densest white cluster on foreground.")
-    print("Keys: b=relearn  d=debug panels  +/-=bg  9/0=white  [/]=sat  ,/.=density  q=quit")
+    print("Red dot = densest color cluster on foreground.")
     print(
-        f"Resolution {args.resolution}p ({preset['width']}x{preset['height']}), "
-        f"processing at {process_scale:.0%} of capture."
+        "Keys: b=relearn  c=white/yellow  d=debug panels  +/-=bg  "
+        "9/0=brightness  [/]=sat  ,/.=density  q=quit"
     )
-    print("Set RESOLUTION=1080 or RESOLUTION=720 for both start_gopro.sh and run_tracker.sh.")
+    if is_file:
+        print(f"Playing file {source_str}, processing at {process_scale:.0%} of capture.")
+    else:
+        print(
+            f"Resolution {args.resolution}p ({preset['width']}x{preset['height']}), "
+            f"processing at {process_scale:.0%} of capture."
+        )
+        print(
+            "Set RESOLUTION=1080 or RESOLUTION=720 for both start_gopro.sh and run_tracker.sh."
+        )
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.01)
-            continue
+        frame = frame_source.read()
+        if frame is None:
+            break
 
         frame_count += 1
         elapsed = time.perf_counter() - t0
         fps = frame_count / max(elapsed, 1e-6)
 
-        if not size_warned:
+        if not size_warned and frame_source.is_live:
             actual_w, actual_h = frame.shape[1], frame.shape[0]
             if (actual_w, actual_h) != (preset["width"], preset["height"]):
                 print(
@@ -253,10 +343,17 @@ def main():
 
         result = tracker.process(frame, debug=show_debug)
 
-        status = (
-            f"{fps:.0f} fps  {args.resolution}p ({frame.shape[1]}x{frame.shape[0]})"
-            f"  proc={tracker.process_scale:.0%}"
-        )
+if is_file:
+            status = (
+                f"{fps:.0f} fps  {frame.shape[1]}x{frame.shape[0]}"
+                f"  proc={tracker.process_scale:.0%}"
+            )
+        else:
+            status = (
+                f"{fps:.0f} fps  {args.resolution}p ({frame.shape[1]}x{frame.shape[0]})"
+                f"  proc={tracker.process_scale:.0%}"
+            )
+        status += f"  target={tracker.color_target}"
         if not tracker.is_ready:
             n, total = tracker.warmup_progress
             status += f"  learning bg {n}/{total}"
@@ -265,7 +362,6 @@ def main():
             status += f"  ball=({x},{y})"
         else:
             status += "  no ball"
-
         cv2.putText(frame, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
         if result:
             draw_dot(frame, result.density_peak)
@@ -274,41 +370,58 @@ def main():
 
         if show_debug and result and result.foreground is not None:
             cv2.imshow(WIN_FG, result.foreground)
-            white_view = result.white_fg
-            draw_dot(white_view, result.density_peak_proc)
-            cv2.imshow(WIN_WHITE, white_view)
+            color_view = result.color_fg.copy()
+            draw_dot(color_view, result.density_peak_proc)
+            draw_color_panel_label(color_view, tracker.color_target)
+            cv2.imshow(WIN_COLOR, color_view)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         if key == ord("b"):
             tracker.reset()
+        if key == ord("c"):
+            tracker.toggle_color_target()
+            cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
         if key == ord("d"):
             show_debug = not show_debug
             if show_debug:
                 open_window(WIN_FG, dbg_w, dbg_h, 80, live_h + 100)
-                open_window(WIN_WHITE, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+                open_window(WIN_COLOR, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+                cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
             else:
                 cv2.destroyWindow(WIN_FG)
-                cv2.destroyWindow(WIN_WHITE)
+                cv2.destroyWindow(WIN_COLOR)
         if key in (ord("+"), ord("=")):
             tracker.diff_threshold = min(100, tracker.diff_threshold + 3)
         if key == ord("-"):
             tracker.diff_threshold = max(5, tracker.diff_threshold - 3)
         if key == ord("9"):
-            tracker.white_threshold = max(50, tracker.white_threshold - 5)
+            if tracker.color_target == "white":
+                tracker.white_threshold = max(50, tracker.white_threshold - 5)
+            else:
+                tracker.yellow_min_val = max(50, tracker.yellow_min_val - 5)
         if key == ord("0"):
-            tracker.white_threshold = min(255, tracker.white_threshold + 5)
+            if tracker.color_target == "white":
+                tracker.white_threshold = min(255, tracker.white_threshold + 5)
+            else:
+                tracker.yellow_min_val = min(255, tracker.yellow_min_val + 5)
         if key == ord("["):
-            tracker.max_saturation = max(10, tracker.max_saturation - 5)
+            if tracker.color_target == "white":
+                tracker.max_saturation = max(10, tracker.max_saturation - 5)
+            else:
+                tracker.yellow_min_sat = max(10, tracker.yellow_min_sat - 5)
         if key == ord("]"):
-            tracker.max_saturation = min(255, tracker.max_saturation + 5)
+            if tracker.color_target == "white":
+                tracker.max_saturation = min(255, tracker.max_saturation + 5)
+            else:
+                tracker.yellow_min_sat = min(255, tracker.yellow_min_sat + 5)
         if key == ord(","):
             tracker.density_radius = max(3, tracker.density_radius - 2)
         if key == ord("."):
             tracker.density_radius += 2
 
-    cap.release()
+    frame_source.release()
     cv2.destroyAllWindows()
 
 
