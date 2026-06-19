@@ -89,6 +89,30 @@ Optional overrides:
 - `VIDEO_DEVICE` — default `/dev/video42`
 - `RESOLUTION` — `1080` or `720`, must match Terminal 1
 
+## Field calibration
+
+Before tracking, the first frame freezes so you can define:
+
+1. **ROI** (4 clicks) — pitch-active region
+2. **Ignore zones** (paint) — hard-masked false-positive areas
+3. **Strike zone** (4 clicks) — overlay only
+4. **Release zone** (click + drag radius) — overlay only
+
+Keys during calibration: `1`–`4` switch mode, `[`/`]` brush size, `Enter` start, `q` quit.
+
+```bash
+# Interactive calibration, save for reuse
+python track_ball.py --source /dev/video42 --save-calibration configs/field.json
+
+# Reuse saved calibration
+python track_ball.py --source /dev/video42 --calibration configs/field.json
+
+# Legacy: no spatial filtering
+python track_ball.py --source /dev/video42 --skip-calibration
+```
+
+Yellow dot = tracker validation (Choice B). Red dot = detection inside ROI (`pitch_active`).
+
 ## How the pieces relate
 
 ```text
