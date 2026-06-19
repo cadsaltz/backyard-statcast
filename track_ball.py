@@ -15,7 +15,9 @@ from typing import Literal
 import cv2
 import numpy as np
 
+from calibration import FieldCalibration
 from frame_source import open_frame_source
+from spatial_filter import classify_point, scale_point_to_pixels, scaled_polygons
 
 WIN_LIVE = "Ball Tracker"
 WIN_FG = "Foreground"
@@ -28,6 +30,7 @@ RESOLUTION_PRESETS = {
     "720": {"width": 1280, "height": 720, "process_scale": 1.0, "live_win": (640, 360)},
 }
 
+PITCH_IDLE_FRAMES = 30
 
 
 @dataclass
@@ -253,10 +256,40 @@ def draw_color_panel_label(img: np.ndarray, target: ColorTarget) -> None:
     )
 
 
-def draw_dot(img: np.ndarray, pt: tuple[int, int] | None) -> None:
+def draw_calibration_overlay(frame: np.ndarray, cal: FieldCalibration) -> None:
+    h, w = frame.shape[:2]
+    roi = np.array(scaled_polygons(cal.roi, frame_width=w, frame_height=h), np.int32)
+    strike = np.array(
+        scaled_polygons(cal.strike_zone, frame_width=w, frame_height=h), np.int32
+    )
+    cv2.polylines(frame, [roi], True, (0, 255, 0), 2)
+    cv2.polylines(frame, [strike], True, (255, 128, 0), 2)
+
+    cx, cy = scale_point_to_pixels(
+        cal.release_center, frame_width=w, frame_height=h
+    )
+    radius_px = int(cal.release_radius * min(w, h))
+    cv2.circle(frame, (cx, cy), radius_px, (255, 0, 255), 2)
+
+    if cal.ignore_mask is not None and cv2.countNonZero(cal.ignore_mask):
+        mask_full = cal.ignore_mask
+        if mask_full.shape[:2] != (h, w):
+            mask_full = cv2.resize(mask_full, (w, h), interpolation=cv2.INTER_NEAREST)
+        tint = frame.copy()
+        tint[mask_full > 0] = (40, 40, 40)
+        cv2.addWeighted(tint, 0.35, frame, 0.65, 0, frame)
+
+
+def draw_track_dot(
+    img: np.ndarray,
+    pt: tuple[int, int] | None,
+    *,
+    pitch_active: bool,
+) -> None:
     if pt is None:
         return
-    cv2.circle(img, pt, 7, (0, 0, 255), -1)
+    color = (0, 0, 255) if pitch_active else (0, 255, 255)
+    cv2.circle(img, pt, 7, color, -1)
     cv2.circle(img, pt, 9, (255, 255, 255), 2)
 
 
@@ -281,6 +314,8 @@ def main():
             source_str, preset["width"], preset["height"]
         )
 
+    cal: FieldCalibration | None = None
+
     tracker = BallTracker(
         process_scale=process_scale,
         diff_threshold=args.threshold,
@@ -294,6 +329,8 @@ def main():
     frame_count = 0
     t0 = time.perf_counter()
     size_warned = False
+    pitch_active = False
+    idle_frames = 0
 
     if is_file:
         live_w, live_h = 960, 540
@@ -306,7 +343,8 @@ def main():
         open_window(WIN_COLOR, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
         cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
 
-    print("Red dot = densest color cluster on foreground.")
+    print("Calibration: 1=ROI 2=Ignore 3=Strike 4=Release  Enter=start")
+    print("Yellow dot = tracking validation  Red dot = pitch active (inside ROI)")
     print(
         "Keys: b=relearn  c=white/yellow  d=debug panels  +/-=bg  "
         "9/0=brightness  [/]=sat  ,/.=density  q=quit"
@@ -343,7 +381,20 @@ def main():
 
         result = tracker.process(frame, debug=show_debug)
 
-if is_file:
+        detection = result.density_peak if result else None
+        if detection:
+            idle_frames = 0
+            if cal is not None:
+                cls = classify_point(detection, cal)
+                if cls.in_roi:
+                    pitch_active = True
+        else:
+            idle_frames += 1
+            if idle_frames >= PITCH_IDLE_FRAMES:
+                pitch_active = False
+                idle_frames = 0
+
+        if is_file:
             status = (
                 f"{fps:.0f} fps  {frame.shape[1]}x{frame.shape[0]}"
                 f"  proc={tracker.process_scale:.0%}"
@@ -362,16 +413,22 @@ if is_file:
             status += f"  ball=({x},{y})"
         else:
             status += "  no ball"
+        if pitch_active:
+            status += "  PITCH"
+        else:
+            status += "  track"
+
         cv2.putText(frame, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        if result:
-            draw_dot(frame, result.density_peak)
+        if cal is not None:
+            draw_calibration_overlay(frame, cal)
+        draw_track_dot(frame, detection, pitch_active=pitch_active)
 
         cv2.imshow(WIN_LIVE, frame)
 
         if show_debug and result and result.foreground is not None:
             cv2.imshow(WIN_FG, result.foreground)
             color_view = result.color_fg.copy()
-            draw_dot(color_view, result.density_peak_proc)
+            draw_track_dot(color_view, result.density_peak_proc, pitch_active=pitch_active)
             draw_color_panel_label(color_view, tracker.color_target)
             cv2.imshow(WIN_COLOR, color_view)
 
@@ -380,6 +437,8 @@ if is_file:
             break
         if key == ord("b"):
             tracker.reset()
+            pitch_active = False
+            idle_frames = 0
         if key == ord("c"):
             tracker.toggle_color_target()
             cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
