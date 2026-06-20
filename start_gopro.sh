@@ -6,8 +6,39 @@ GOPRO_DIR="$PROJECT_DIR/gopro_as_webcam_on_linux"
 RESOLUTION="${RESOLUTION:-1080}"
 FOV="${FOV:-narrow}"
 
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resolution)
+      RESOLUTION="$2"
+      shift 2
+      ;;
+    --resolution=*)
+      RESOLUTION="${1#*=}"
+      shift
+      ;;
+    --fov)
+      FOV="$2"
+      shift 2
+      ;;
+    --fov=*)
+      FOV="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: ./start_gopro.sh [--resolution 1080|720] [--fov wide|narrow|superview|linear]" >&2
+      exit 1
+      ;;
+  esac
+done
+
 if [[ "$RESOLUTION" != "1080" && "$RESOLUTION" != "720" ]]; then
-  echo "RESOLUTION must be 1080 or 720 (got: $RESOLUTION)" >&2
+  echo "Resolution must be 1080 or 720 (got: $RESOLUTION)" >&2
+  exit 1
+fi
+
+if [[ "$FOV" != "wide" && "$FOV" != "narrow" && "$FOV" != "superview" && "$FOV" != "linear" ]]; then
+  echo "FOV must be wide, narrow, superview, or linear (got: $FOV)" >&2
   exit 1
 fi
 

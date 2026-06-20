@@ -760,7 +760,7 @@ def main():
             f"processing at {process_scale:.0%} of capture."
         )
         print(
-            "Set RESOLUTION=1080 or RESOLUTION=720 for both start_gopro.sh and run_tracker.sh."
+            "Set --resolution 1080 or --resolution 720 for both start_gopro.sh and run_tracker.sh."
         )
 
     while True:

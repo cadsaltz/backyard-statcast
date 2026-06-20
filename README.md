@@ -1,18 +1,338 @@
 # Backyard Statcast
 
-Live GoPro HERO10 video feed on Linux for a backyard pitch-tracking project.
+Live ball tracking from a GoPro HERO10, USB webcam, or recorded video on Linux.
 
-Ball tracking runs via `track_ball.py` on a live GoPro feed or recorded video, with optional spatial calibration to filter background noise.
+## Quick start
+
+| Goal | Command |
+|------|---------|
+| **GoPro live tracking** | Terminal 1: `./start_gopro.sh` → Terminal 2: `./run_tracker.sh` |
+| **USB webcam live tracking** | `./run_tracker.sh --input webcam` |
+| **Recorded video tracking** | `./run_video.sh clip.mp4` |
+
+---
+
+## User guide: launcher scripts
+
+Three shell scripts start everything. Each script has **its own options** plus **passthrough options** that are forwarded to `track_ball.py` unchanged.
+
+```text
+GoPro USB  -->  start_gopro.sh  -->  /dev/video42  --+
+                                                       |
+USB webcam  -----------------------------------------+-->  run_tracker.sh  -->  track_ball.py
+                                                       |
+video file  -->  run_video.sh  ------------------------+
+```
+
+### Syntax
+
+```bash
+./start_gopro.sh [--resolution 1080|720] [--fov wide|narrow|superview|linear]
+
+./run_tracker.sh [--input gopro|webcam] [--resolution 1080|720] [track_ball.py options...]
+
+./run_video.sh <video-file> [track_ball.py options...]
+# or: VIDEO_FILE=clip.mp4 ./run_video.sh [track_ball.py options...]
+```
+
+---
+
+### `start_gopro.sh`
+
+Starts the GoPro USB webcam bridge. **GoPro workflow only.** Leave running in Terminal 1.
+
+#### Native options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--resolution` | CLI flag | `1080` | GoPro stream resolution: `1080` or `720`. Must match `run_tracker.sh --resolution`. |
+| `--resolution=720` | CLI flag | — | Shorthand for `--resolution 720`. |
+| `RESOLUTION` | env var | `1080` | Same as `--resolution`. Used only when the flag is omitted. |
+| `--fov` | CLI flag | `narrow` | GoPro lens: `wide`, `narrow`, `superview`, `linear`. |
+| `--fov=linear` | CLI flag | — | Shorthand for `--fov linear`. |
+| `FOV` | env var | `narrow` | Same as `--fov`. Used only when the flag is omitted. |
+| `GOPRO_HOST_IP` | env var | auto | Force laptop USB IP (e.g. `172.23.138.52`). Normally auto-detected via `enx*` interface. |
+
+No passthrough options — this script only talks to the GoPro.
+
+#### Examples
+
+```bash
+./start_gopro.sh
+./start_gopro.sh --resolution 720
+./start_gopro.sh --fov linear
+./start_gopro.sh --resolution 720 --fov narrow
+GOPRO_HOST_IP=172.23.138.52 ./start_gopro.sh
+```
+
+#### Success checklist
+
+- GoPro screen shows **webcam**
+- Terminal keeps printing `ffmpeg` output
+- `/dev/video42` exists and is a capture device
+
+---
+
+### `run_tracker.sh`
+
+Main entry point for **live** ball tracking. Picks the camera, sets resolution, then runs `track_ball.py`.
+
+#### Native options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--input` | CLI flag | `gopro` | Video source: `gopro` (needs bridge) or `webcam` (direct USB camera). |
+| `--input=webcam` | CLI flag | — | Shorthand for `--input webcam`. |
+| `INPUT_SOURCE` | env var | `gopro` | Same as `--input`. Used only when the flag is omitted. |
+| `--resolution` | CLI flag | `1080` (GoPro), `720` (webcam) | Capture preset: `1080` (1920×1080) or `720` (1280×720). For GoPro, must match `start_gopro.sh`. |
+| `--resolution=720` | CLI flag | — | Shorthand for `--resolution 720`. |
+| `RESOLUTION` | env var | same as above | Same as `--resolution`. Used only when the flag is omitted. |
+| `VIDEO_DEVICE` | env var | auto | Override device path. Default: `/dev/video42` (GoPro) or first external USB webcam (skips laptop built-in). |
+
+#### Passthrough options (forwarded to `track_ball.py`)
+
+Any flag not recognized by `run_tracker.sh` is passed through. All of these work:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--color white\|yellow` | `white` | Ball color target. Toggle live with `c`. |
+| `--threshold` | `25` | Motion sensitivity. Higher = less sensitive. Tune live with `-`/`+`. |
+| `--white` | `140` | Brightness cutoff (white balls). Tune live with `9`/`0`. |
+| `--saturation` | `100` | Max saturation (white balls). Tune live with `[`/`]`. |
+| `--density-radius` | `12` | Peak search radius in pixels. Tune live with `,`/`.`. |
+| `--process-scale` | auto | Detection scale fraction. Default `0.5` at 1080p, `1.0` at 720p. |
+| `--no-debug` | off | Hide debug panels for more FPS. Toggle live with `d`. |
+| `--calibration PATH` | `configs/field.json` | Load saved field preset. |
+| `--save-calibration PATH` | same as `--calibration` | Save preset path after calibration UI. |
+| `--recalibrate` | off | Force calibration UI even if preset exists. |
+| `--skip-calibration` | off | Run without ROI / ignore zones. |
+
+> **Note:** Do not pass `--source` or `--resolution` twice — `run_tracker.sh` sets both automatically from `--input`, `VIDEO_DEVICE`, and `--resolution`.
+
+#### Examples
+
+```bash
+# GoPro (two terminals, 1080p default)
+./start_gopro.sh
+./run_tracker.sh
+
+# GoPro at 720p (set on BOTH scripts)
+./start_gopro.sh --resolution 720
+./run_tracker.sh --resolution 720
+
+# USB webcam (one terminal, 720p default)
+./run_tracker.sh --input webcam
+
+# Webcam on a specific device
+VIDEO_DEVICE=/dev/video2 ./run_tracker.sh --input webcam
+
+# Tuning and calibration
+./run_tracker.sh --color yellow --no-debug
+./run_tracker.sh --recalibrate
+./run_tracker.sh --skip-calibration
+./run_tracker.sh --input webcam --process-scale 0.5
+./run_tracker.sh --calibration configs/backyard.json
+```
+
+---
+
+### `run_video.sh`
+
+**Recorded video** tracking. No camera or GoPro bridge needed.
+
+#### Native options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `<video-file>` | positional arg | required | Path to `.mp4`, `.mov`, etc. |
+| `VIDEO_FILE` | env var | — | Alternative to positional arg: `VIDEO_FILE=clip.mp4 ./run_video.sh` |
+| `COLOR` | env var | `white` | Ball color: `white` or `yellow`. Passed as `--color` to `track_ball.py`. |
+
+#### Passthrough options (forwarded to `track_ball.py`)
+
+Same passthrough table as `run_tracker.sh` above, **except**:
+
+- `--resolution` has no effect on files (native video resolution is used)
+- `--source` is set automatically from the video file path
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--color white\|yellow` | `white` (or `COLOR` env) | Ball color target. |
+| `--threshold` | `25` | Motion sensitivity. |
+| `--white` | `140` | Brightness cutoff. |
+| `--saturation` | `100` | Max saturation. |
+| `--density-radius` | `12` | Peak search radius. |
+| `--process-scale` | `1.0` | Detection scale (default full resolution for files). |
+| `--no-debug` | off | Hide debug panels. |
+| `--calibration PATH` | `configs/field.json` | Load field preset. |
+| `--save-calibration PATH` | same as `--calibration` | Save preset path. |
+| `--recalibrate` | off | Force calibration UI. |
+| `--skip-calibration` | off | Skip spatial filtering. |
+
+#### Examples
+
+```bash
+./run_video.sh clip.mp4
+./run_video.sh clip.mp4 --color yellow --no-debug
+COLOR=yellow ./run_video.sh clip.mp4
+./run_video.sh clip.mp4 --recalibrate
+./run_video.sh clip.mp4 --skip-calibration --process-scale 0.5
+VIDEO_FILE=clip.mp4 ./run_video.sh --calibration configs/backyard.json
+```
+
+---
+
+## Resolution and process scaling
+
+| `--resolution` | Capture size | Default `--process-scale` | Internal detection size |
+|----------------|-------------|---------------------------|---------------------------|
+| `1080` | 1920×1080 | `0.5` | 960×540 |
+| `720` | 1280×720 | `1.0` | 1280×720 |
+
+**GoPro:** set `--resolution` on **both** `start_gopro.sh` and `run_tracker.sh`.
+
+**Webcam:** `run_tracker.sh --input webcam` defaults to `720`. Override with `--resolution 720` (or `1080` if your cam supports it).
+
+**Recorded video:** resolution comes from the file. Override detection cost with `--process-scale`.
+
+```bash
+# 1080p capture but full-res detection (slower, more precise)
+./run_tracker.sh --process-scale 1.0
+
+# 720p capture but half-res detection (faster)
+./run_tracker.sh --input webcam --process-scale 0.5
+```
+
+---
+
+## Runtime keys
+
+Pressed inside the OpenCV window while tracking.
+
+### Tracking (`track_ball.py`)
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `b` | Reset background, pitch state, and live pitch trace |
+| `c` | Toggle ball color: white ↔ yellow |
+| `d` | Toggle debug panels |
+| `-` / `+` | Motion threshold down / up |
+| `9` / `0` | Brightness down / up |
+| `[` / `]` | Saturation tolerance down / up |
+| `,` / `.` | Density radius down / up |
+
+Yellow dot = tracker lock. Red dot = pitch recording active.
+
+### Calibration UI (first run or `--recalibrate`)
+
+| Key | Action |
+|-----|--------|
+| `1`–`4` | Switch mode: ROI / ignore / strike zone / release zone |
+| `[` / `]` | Brush size (ignore mode) |
+| `c` | Clear current region |
+| `u` | Undo last ignore stroke |
+| `Enter` / `s` | Finish and start tracking |
+| `q` / `Esc` | Cancel |
+
+Recorded video: `,`/`.` or arrow keys scrub frames.
+
+---
+
+## Field calibration
+
+On first run (or with `--recalibrate`), define four regions:
+
+1. **ROI** — where the ball can appear (hard filter)
+2. **Ignore zones** — painted false-positive masks (sky, fence, etc.)
+3. **Strike zone** — visual overlay
+4. **Release zone** — where pitch recording starts
+
+Saved to `configs/field.json` + `configs/field_ignore.png`. Later runs load automatically.
+
+```bash
+./run_tracker.sh                              # loads preset if it exists
+./run_tracker.sh --recalibrate                # redraw and overwrite preset
+./run_tracker.sh --skip-calibration           # no spatial filtering
+./run_video.sh clip.mp4 --calibration configs/backyard.json
+```
+
+---
+
+## Pitch detection
+
+When calibration is loaded:
+
+- Recording starts on release-like motion in the release zone
+- Cyan flight path drawn live during recording
+- Path fades over ~4 seconds after pitch ends
+- Analytics logged to console (v1)
+
+Status line: `PITCH` while recording, `idle` otherwise.
+
+---
+
+## Other tools
+
+### `run_strategy_test.sh`
+
+Compare detection algorithms live. Requires GoPro bridge.
+
+```bash
+./start_gopro.sh
+./run_strategy_test.sh [--strategy mog2|brightness|combined|frame_diff|hough|adaptive|mediapipe|yolo]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `VIDEO_DEVICE` | `/dev/video42` | Capture device override |
+
+### `show_gopro.py`
+
+Raw camera viewer, no tracking or calibration.
+
+```bash
+python show_gopro.py [--device /dev/video42] [--no-track]
+```
+
+### `track_ball.py` (direct)
+
+Call directly for full control. Same flags as the passthrough tables above, plus:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--source` | `/dev/video42` | Device path or video file |
+| `--device` | — | Deprecated alias for `--source` |
+
+```bash
+python track_ball.py --source /dev/video42 --resolution 1080
+python track_ball.py --source clip.mp4 --color yellow
+```
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `start_gopro.sh` | GoPro USB bridge → `/dev/video42` |
+| `run_tracker.sh` | Live tracking launcher (GoPro or webcam) |
+| `run_video.sh` | Recorded-video tracking launcher |
+| `video_source.sh` | Device auto-detection (used by `run_tracker.sh`) |
+| `track_ball.py` | Core ball tracker |
+| `run_strategy_test.sh` | Detection algorithm comparison |
+| `show_gopro.py` | Simple raw feed viewer |
+| `gopro_as_webcam_on_linux/` | Third-party GoPro USB helper |
+
+---
 
 ## Prerequisites
 
-- GoPro HERO10 connected by USB data cable
-- Camera set to GoPro Connect mode
+- GoPro HERO10 + USB data cable (GoPro workflow only)
+- Camera set to **GoPro Connect** (GoPro workflow only)
 - Python virtualenv in `.venv`
 - System packages: `ffmpeg`, `v4l2loopback-dkms`, `v4l2loopback-utils`
-- Cloned helper repo: `gopro_as_webcam_on_linux/`
-
-Install Python deps:
+- Cloned helper: `gopro_as_webcam_on_linux/`
 
 ```bash
 python -m venv .venv
@@ -20,150 +340,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Two-terminal workflow
-
-Use two terminals. One starts the camera bridge. The other shows the live feed.
-
-### Terminal 1: `start_gopro.sh`
-
-This script:
-
-1. Starts the GoPro in webcam mode over USB
-2. Receives the camera's UDP stream
-3. Pipes it through `ffmpeg` into a virtual Linux webcam device, usually `/dev/video42`
-
-Run it and leave it running:
-
-```bash
-./start_gopro.sh
-```
-
-When it works, the GoPro screen should show webcam mode and the terminal should keep printing `ffmpeg` output.
-
-Environment variables you can override:
-
-- `GOPRO_HOST_IP` — optional fixed laptop USB network IP; by default the script auto-detects the GoPro `enx*` interface
-- `RESOLUTION` — `1080` (default) or `720`
-- `FOV` — default `narrow`
-
-If the camera does not enter webcam mode, check that it is on, connected with a data cable, and set to **GoPro Connect** in USB settings. Then confirm Linux sees the USB interface:
-
-```bash
-ip -4 addr show | grep -A2 enx
-```
-
-You should see an `enx...` device with an address like `172.23.x.x`. If that IP changed after a reboot or reconnect, do not hardcode the old value; just rerun `./start_gopro.sh`.
-
-### Terminal 2: `run_tracker.sh`
-
-This script does **not** start the GoPro bridge. It assumes Terminal 1 is already running and `/dev/video42` exists.
-
-It:
-
-1. Checks that `/dev/video42` is a usable capture device
-2. Activates `.venv`
-3. Runs `track_ball.py`, which tracks the ball and shows the live feed
-
-Run it after Terminal 1 is up:
-
-```bash
-./run_tracker.sh
-```
-
-Use the same `RESOLUTION` in both terminals:
-
-```bash
-# 1080p (default)
-./start_gopro.sh
-./run_tracker.sh
-
-# 720p
-RESOLUTION=720 ./start_gopro.sh
-RESOLUTION=720 ./run_tracker.sh
-```
-
-Press `q` in the video window to quit the viewer. That does not stop the GoPro bridge in Terminal 1.
-
-Optional overrides:
-
-- `VIDEO_DEVICE` — default `/dev/video42`
-- `RESOLUTION` — `1080` or `720`, must match Terminal 1
-
-## Field calibration
-
-Before tracking, the first frame freezes so you can define:
-
-1. **ROI** (4 clicks) — pitch-active region
-2. **Ignore zones** (paint) — hard-masked false-positive areas
-3. **Strike zone** (4 clicks) — overlay only
-4. **Release zone** (click + drag radius) — overlay only
-
-Keys during calibration: `1`–`4` switch mode, `[`/`]` brush size, `Enter` start, `q` quit.
-
-- **Live feed:** video keeps rolling while you draw; tracking starts when you press Enter.
-- **Recorded video:** frozen frame; `,`/`.` or arrow keys scrub to pick a frame (ignore paint clears on scrub).
-
-### Presets (save once, reuse every run)
-
-The first time you calibrate, regions are saved automatically to `configs/field.json` (+ `configs/field_ignore.png`). On later runs, `./run_tracker.sh` loads that preset and skips the UI.
-
-```bash
-# Normal — loads configs/field.json if it exists, otherwise opens calibration UI
-./run_tracker.sh
-
-# Redraw regions and overwrite the preset
-./run_tracker.sh --recalibrate
-
-# Use a named preset file
-python track_ball.py --source /dev/video42 --calibration configs/backyard.json --save-calibration configs/backyard.json
-
-# Tracking without spatial filtering
-./run_tracker.sh --skip-calibration
-```
-
-Yellow dot = tracker validation (Choice B). Red dot = pitch recording.
-
-## Pitch detection
-
-When calibration is loaded, the tracker runs a pitch state machine alongside Search/Track mode:
-
-- **Recording** starts within 1–2 frames of release-like motion in the release zone (strong rightward vs vertical motion).
-- A **cyan flight path** is drawn live during recording (confirms data is being collected).
-- When the pitch ends (impact, plate crossing, or track loss near the zone), the path **fades out over ~4 seconds** so the next pitch has a clean view.
-- Pitch analytics (velocity, break, fit) are not run live; completed pitches are validated and logged to the console in v1.
-
-Status line: `PITCH` while recording, `idle` otherwise.
-
-## How the pieces relate
-
-```text
-GoPro HERO10 (USB)
-        |
-        v
-start_gopro.sh
-  -> gopro_as_webcam_on_linux/gopro
-  -> ffmpeg
-  -> /dev/video42
-        |
-        v
-run_tracker.sh
-  -> track_ball.py
-  -> OpenCV windows on laptop
-```
-
-`start_gopro.sh` creates the video device.
-`run_tracker.sh` only reads from that device and displays it.
-
-## Files
-
-- `start_gopro.sh` — start GoPro bridge and virtual webcam
-- `run_tracker.sh` — ball tracker from `/dev/video42`
-- `track_ball.py` — density-based ball tracking
-- `show_gopro.py` — simple raw feed viewer (no tracking)
-- `gopro_as_webcam_on_linux/` — third-party GoPro USB webcam helper
-
 ## Notes
 
-- The live GoPro webcam feed is about 1080p30, not high-FPS recording mode.
-- If `/dev/video42` is missing, the bridge is not running or not ready yet.
-- If you reboot after installing `v4l2loopback-dkms` with Secure Boot enabled, you may need to enroll the MOK key once at boot.
+- GoPro live feed is ~1080p30 in webcam mode, not high-FPS recording mode.
+- USB webcams (e.g. Logitech C270) max at 720p — `--input webcam` defaults to `--resolution 720`.
+- If `/dev/video42` is missing, the GoPro bridge is not running.
+- Secure Boot: after installing `v4l2loopback-dkms`, enroll the MOK key at boot if prompted.
