@@ -1,6 +1,7 @@
 from pitch_geometry import build_field_geometry
 from pitch_state import (
     PitchConfig,
+    PitchDiscardReason,
     PitchEndReason,
     PitchFrameInput,
     PitchMode,
@@ -11,7 +12,10 @@ from pitch_state import (
 
 def test_pitch_config_defaults():
     cfg = PitchConfig()
-    assert cfg.ring_buffer_frames == 10
+    assert cfg.ring_buffer_frames == 4
+    assert cfg.backfill_frames == 3
+    assert cfg.max_pitch_sec == 20.0
+    assert cfg.max_pitch_frames == 120
     assert cfg.tracer_fade_sec == 4.0
     assert cfg.dominance_ratio == 2.0
 
@@ -61,6 +65,21 @@ def test_start_recording_on_release_motion():
     assert sm.active_samples[0].frame_index == 1  # backfill
 
 
+def test_backfill_capped_to_config():
+    geom = _geom()
+    sm = PitchStateMachine(geom, PitchConfig(backfill_frames=2, ring_buffer_frames=4))
+    cx, cy = geom.release_cx_proc, geom.release_cy_proc
+
+    sm.update(PitchFrameInput(1, 0.0, cx - 15, cy, detected=True))
+    sm.update(PitchFrameInput(2, 0.03, cx - 10, cy, detected=True))
+    sm.update(PitchFrameInput(3, 0.06, cx - 5, cy, detected=True))
+    sm.update(
+        PitchFrameInput(4, 0.09, cx + 8, cy + 1, detected=True)
+    )
+    assert sm.mode == PitchMode.RECORDING
+    assert [s.frame_index for s in sm.active_samples] == [2, 3, 4]
+
+
 def _recording_sm():
     geom = _geom()
     sm = PitchStateMachine(geom)
@@ -71,23 +90,48 @@ def _recording_sm():
     return sm, geom
 
 
-def test_end_on_plate_passed():
+def test_end_on_strike_zone_right():
     sm, geom = _recording_sm()
-    cx, cy = geom.release_cx_proc, geom.release_cy_proc
-    threshold = geom.strike_trailing_x_proc + geom.pass_margin_proc
+    right = geom.strike_right_x_proc
+    y = (geom.release_cy_proc + geom.strike_bottom_y_proc) // 2
+    x = geom.release_cx_proc + 20
     result = None
-    for i, fi in enumerate(range(3, 20)):
-        x = cx + 10 + i * 12
-        result = sm.update(PitchFrameInput(fi, 0.05 * i, x, cy, detected=True))
-        if result.pitch_completed is not None:
+    for i, fi in enumerate(range(3, 45)):
+        x += 4
+        result = sm.update(PitchFrameInput(fi, 0.05 * i, x, y, detected=True))
+        if result.pitch_completed is not None or result.pitch_discarded:
             break
-        if x >= threshold + 5 and len(sm.active_samples) >= sm.config.min_detected_samples:
-            # past plate with enough samples — next frame should finalize
-            continue
     assert result is not None
     assert result.pitch_completed is not None
-    assert result.pitch_completed.end_reason == PitchEndReason.PLATE_PASSED
+    assert result.pitch_completed.end_reason == PitchEndReason.STRIKE_ZONE_RIGHT
     assert sm.mode == PitchMode.IDLE
+
+
+def test_end_on_strike_zone_bottom():
+    sm, geom = _recording_sm()
+    bottom = geom.strike_bottom_y_proc
+    x = geom.strike_leading_x_proc + 10
+    y = geom.release_cy_proc
+    result = None
+    for i, fi in enumerate(range(3, 40)):
+        y += 4
+        result = sm.update(PitchFrameInput(fi, 0.05 * i, x, y, detected=True))
+        if result.pitch_completed is not None or result.pitch_discarded:
+            break
+    assert result is not None
+    assert result.pitch_completed is not None
+    assert result.pitch_completed.end_reason == PitchEndReason.STRIKE_ZONE_BOTTOM
+    assert sm.mode == PitchMode.IDLE
+
+
+def test_crossed_strike_zone_edges():
+    geom = _geom()
+    right_line = geom.strike_right_line_proc
+    bottom_line = geom.strike_bottom_line_proc
+    assert geom.crossed_strike_right_edge(right_line - 5, 100, right_line + 1, 100)
+    assert not geom.crossed_strike_right_edge(right_line + 1, 100, right_line + 5, 100)
+    assert geom.crossed_strike_bottom_edge(100, bottom_line - 5, 100, bottom_line + 1)
+    assert not geom.crossed_strike_bottom_edge(100, bottom_line + 1, 100, bottom_line + 5)
 
 
 def test_gap_tolerance_does_not_end_pitch():
@@ -109,6 +153,7 @@ def test_discard_false_start_with_no_forward_progress():
     result = sm.update(PitchFrameInput(4, 0.13, geom.release_cx_proc + 3, geom.release_cy_proc, detected=True))
     assert result.pitch_discarded is True
     assert result.pitch_completed is None
+    assert result.discard_reason == PitchDiscardReason.TIMEOUT
 
 
 def test_track_lost_terminal_saves_incomplete():

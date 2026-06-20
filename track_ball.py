@@ -859,7 +859,12 @@ def main():
                 )
             elif update_result.pitch_discarded:
                 pitch_tracer.finalize_path(now=now, valid=False)
-                print("Pitch discarded")
+                reason = (
+                    update_result.discard_reason.value
+                    if update_result.discard_reason is not None
+                    else "unknown"
+                )
+                print(f"Pitch discarded reason={reason}")
 
         if is_file:
             status = (

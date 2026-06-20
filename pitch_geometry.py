@@ -22,10 +22,38 @@ class FieldGeometry:
     release_r_full: float
     strike_leading_x_proc: int
     strike_trailing_x_proc: int
+    strike_right_x_proc: int
+    strike_bottom_y_proc: int
+    strike_right_pad_proc: int
+    strike_bottom_pad_proc: int
     strike_leading_x_full: int
     strike_trailing_x_full: int
     pass_margin_proc: int
     approach_margin_proc: int
+
+    @property
+    def strike_right_line_proc(self) -> int:
+        """Right boundary trigger line (zone edge + padding)."""
+        return self.strike_right_x_proc + self.strike_right_pad_proc
+
+    @property
+    def strike_bottom_line_proc(self) -> int:
+        """Bottom boundary trigger line (zone edge + padding)."""
+        return self.strike_bottom_y_proc + self.strike_bottom_pad_proc
+
+    def crossed_strike_right_edge(
+        self, prev_x: int, prev_y: int, x: int, y: int
+    ) -> bool:
+        """True when path crosses the padded right edge of the strike zone."""
+        line = self.strike_right_line_proc
+        return prev_x < line and x >= line
+
+    def crossed_strike_bottom_edge(
+        self, prev_x: int, prev_y: int, x: int, y: int
+    ) -> bool:
+        """True when path crosses the padded bottom edge of the strike zone."""
+        line = self.strike_bottom_line_proc
+        return prev_y < line and y >= line
 
     def in_release_zone(self, x_proc: int, y_proc: int, *, expand: float = 1.0) -> bool:
         r = self.release_r_proc * expand
@@ -44,6 +72,10 @@ def _strike_x_bounds(strike_pts: list[tuple[int, int]]) -> tuple[int, int]:
     return min(xs), max(xs)
 
 
+def _strike_bottom_y(strike_pts: list[tuple[int, int]]) -> int:
+    return max(p[1] for p in strike_pts)
+
+
 def build_field_geometry(
     cal: FieldCalibration,
     *,
@@ -52,6 +84,7 @@ def build_field_geometry(
     process_scale: float,
     pass_margin_frac: float = 0.03,
     approach_margin_frac: float = 0.04,
+    strike_boundary_pad_frac: float = 0.012,
 ) -> FieldGeometry:
     proc_w = max(1, int(frame_width * process_scale))
     proc_h = max(1, int(frame_height * process_scale))
@@ -66,6 +99,9 @@ def build_field_geometry(
     strike_full = scaled_polygons(cal.strike_zone, frame_width=frame_width, frame_height=frame_height)
     leading_p, trailing_p = _strike_x_bounds(strike_proc)
     leading_f, trailing_f = _strike_x_bounds(strike_full)
+    bottom_y_proc = _strike_bottom_y(strike_proc)
+    right_pad = max(4, int(proc_w * strike_boundary_pad_frac))
+    bottom_pad = max(4, int(proc_h * strike_boundary_pad_frac))
 
     return FieldGeometry(
         proc_w=proc_w,
@@ -80,6 +116,10 @@ def build_field_geometry(
         release_r_full=r_full,
         strike_leading_x_proc=leading_p,
         strike_trailing_x_proc=trailing_p,
+        strike_right_x_proc=trailing_p,
+        strike_bottom_y_proc=bottom_y_proc,
+        strike_right_pad_proc=right_pad,
+        strike_bottom_pad_proc=bottom_pad,
         strike_leading_x_full=leading_f,
         strike_trailing_x_full=trailing_f,
         pass_margin_proc=int(frame_width * process_scale * pass_margin_frac),

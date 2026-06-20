@@ -24,6 +24,12 @@ def test_build_field_geometry_process_coords(sample_cal: FieldCalibration):
     assert geom.proc_w == 960
     assert geom.proc_h == 540
     assert geom.release_cx_proc < geom.strike_leading_x_proc < geom.strike_trailing_x_proc
+    assert geom.strike_right_x_proc == geom.strike_trailing_x_proc
+    assert geom.strike_right_pad_proc >= 4
+    assert geom.strike_bottom_pad_proc >= 4
+    assert geom.strike_right_line_proc > geom.strike_right_x_proc
+    assert geom.strike_bottom_line_proc > geom.strike_bottom_y_proc
+    assert geom.strike_bottom_y_proc > 0
     assert geom.release_r_proc > 0
 
 

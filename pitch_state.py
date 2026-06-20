@@ -24,6 +24,8 @@ class PitchStartReason(Enum):
 class PitchEndReason(Enum):
     STRIKE_CONTACT = "strike_contact"
     HIT_OR_DEFLECTION = "hit_or_deflection"
+    STRIKE_ZONE_RIGHT = "strike_zone_right"
+    STRIKE_ZONE_BOTTOM = "strike_zone_bottom"
     PLATE_PASSED = "plate_passed"
     TRACK_LOST_TERMINAL = "track_lost_terminal"
     TIMEOUT = "timeout"
@@ -31,9 +33,21 @@ class PitchEndReason(Enum):
     ABORTED = "aborted"
 
 
+class PitchDiscardReason(Enum):
+    TOO_FEW_SAMPLES = "too_few_samples"
+    INSUFFICIENT_FORWARD = "insufficient_forward"
+    NOT_NEAR_RELEASE = "not_near_release"
+    TOO_MANY_GAPS = "too_many_gaps"
+    TOO_MANY_RECONNECTS = "too_many_reconnects"
+    STEP_TOO_LARGE = "step_too_large"
+    TIMEOUT = "timeout"
+    INVALID_REACQUIRE = "invalid_reacquire"
+
+
 @dataclass
 class PitchConfig:
-    ring_buffer_frames: int = 10
+    ring_buffer_frames: int = 4
+    backfill_frames: int = 3
     min_dx: float = 5.0
     dominance_ratio: float = 2.0
     min_dy: float = 2.0
@@ -45,8 +59,8 @@ class PitchConfig:
     terminal_lost_frames: int = 8
     max_gap_frames: int = 3
     max_implausible_frames: int = 5
-    max_pitch_frames: int = 22
-    max_pitch_sec: float = 1.5
+    max_pitch_frames: int = 120
+    max_pitch_sec: float = 20.0
     cooldown_frames: int = 18
     min_detected_samples: int = 6
     min_forward_px: float = 40.0
@@ -116,6 +130,7 @@ class PitchUpdateResult:
     mode: PitchMode
     pitch_completed: Pitch | None = None
     pitch_discarded: bool = False
+    discard_reason: PitchDiscardReason | None = None
 
 
 class PitchStateMachine:
@@ -137,6 +152,7 @@ class PitchStateMachine:
         self._reconnects = 0
         self._impact_streak = 0
         self._start_reason: PitchStartReason = PitchStartReason.RELEASE_MOTION
+        self._backfill_count = 0
 
     @property
     def active_samples(self) -> list[PitchSample]:
@@ -155,6 +171,7 @@ class PitchStateMachine:
         self._total_gaps = 0
         self._reconnects = 0
         self._impact_streak = 0
+        self._backfill_count = 0
 
     def _make_sample(self, inp: PitchFrameInput) -> PitchSample | None:
         if not inp.detected or inp.x_proc is None or inp.y_proc is None:
@@ -203,9 +220,10 @@ class PitchStateMachine:
 
     def _start_recording(self, sample: PitchSample, start_reason: PitchStartReason) -> None:
         self.mode = PitchMode.RECORDING
-        self._active = list(self._ring)
-        if not self._active or self._active[-1].frame_index != sample.frame_index:
-            self._active.append(sample)
+        prior = [s for s in self._ring if s.frame_index < sample.frame_index]
+        prior = prior[-self.config.backfill_frames :]
+        self._backfill_count = len(prior)
+        self._active = prior + [sample]
         self._recording_started_at = sample.timestamp_sec
         self._recording_start_frame = sample.frame_index
         self._prev = self._active[-1]
@@ -254,6 +272,17 @@ class PitchStateMachine:
     def _in_approach_zone(self, x_proc: int) -> bool:
         return x_proc >= self.geom.strike_leading_x_proc - self.geom.approach_margin_proc
 
+    def _check_strike_zone_boundary_crossing(self, pts: list[PitchSample]) -> PitchEndReason | None:
+        if len(pts) < 2:
+            return None
+        prev, last = pts[-2], pts[-1]
+        g = self.geom
+        if g.crossed_strike_right_edge(prev.x_proc, prev.y_proc, last.x_proc, last.y_proc):
+            return PitchEndReason.STRIKE_ZONE_RIGHT
+        if g.crossed_strike_bottom_edge(prev.x_proc, prev.y_proc, last.x_proc, last.y_proc):
+            return PitchEndReason.STRIKE_ZONE_BOTTOM
+        return None
+
     def _check_end_while_recording(self) -> PitchEndReason | None:
         pts = [s for s in self._active if s.detected]
         if not pts:
@@ -265,6 +294,10 @@ class PitchStateMachine:
         impact = self._detect_impact()
         if impact is not None:
             return impact
+
+        boundary = self._check_strike_zone_boundary_crossing(pts)
+        if boundary is not None:
+            return boundary
 
         if last.x_proc >= g.strike_trailing_x_proc + g.pass_margin_proc:
             return PitchEndReason.PLATE_PASSED
@@ -293,49 +326,53 @@ class PitchStateMachine:
         max_allowed = self.config.max_step_px + last.speed_px * gap_frames * self.config.reconnect_slack
         return dist <= max_allowed
 
-    def _validate(self, end_reason: PitchEndReason) -> tuple[bool, bool]:
-        """Return (valid, complete)."""
+    def _validate(self, end_reason: PitchEndReason) -> tuple[bool, bool, PitchDiscardReason | None]:
+        """Return (valid, complete, discard_reason)."""
         cfg = self.config
         pts = [s for s in self._active if s.detected]
+        if end_reason == PitchEndReason.INVALID_REACQUIRE:
+            return False, False, PitchDiscardReason.INVALID_REACQUIRE
+        if end_reason == PitchEndReason.TIMEOUT:
+            return False, False, PitchDiscardReason.TIMEOUT
         if len(pts) < cfg.min_detected_samples:
-            return False, False
+            return False, False, PitchDiscardReason.TOO_FEW_SAMPLES
         forward = pts[-1].x_proc - pts[0].x_proc
         if forward < cfg.min_forward_px:
-            return False, False
+            return False, False, PitchDiscardReason.INSUFFICIENT_FORWARD
         near_release = any(s.in_release_zone for s in pts) or any(
             math.hypot(s.x_proc - self.geom.release_cx_proc, s.y_proc - self.geom.release_cy_proc)
             <= self.geom.release_r_proc * 2
             for s in pts[:3]
         )
         if not near_release:
-            return False, False
+            return False, False, PitchDiscardReason.NOT_NEAR_RELEASE
         if self._total_gaps > cfg.max_total_gap_frames:
-            return False, False
+            return False, False, PitchDiscardReason.TOO_MANY_GAPS
         if self._reconnects > cfg.max_reconnects:
-            return False, False
+            return False, False, PitchDiscardReason.TOO_MANY_RECONNECTS
         for i in range(1, len(pts)):
             step = math.hypot(pts[i].x_proc - pts[i - 1].x_proc, pts[i].y_proc - pts[i - 1].y_proc)
             if step > cfg.max_step_px:
-                return False, False
+                return False, False, PitchDiscardReason.STEP_TOO_LARGE
         complete = end_reason in (
             PitchEndReason.STRIKE_CONTACT,
             PitchEndReason.HIT_OR_DEFLECTION,
+            PitchEndReason.STRIKE_ZONE_RIGHT,
+            PitchEndReason.STRIKE_ZONE_BOTTOM,
             PitchEndReason.PLATE_PASSED,
         )
         if end_reason == PitchEndReason.TRACK_LOST_TERMINAL:
             complete = False
-        if end_reason in (PitchEndReason.TIMEOUT, PitchEndReason.INVALID_REACQUIRE):
-            return False, False
-        return True, complete
+        return True, complete, None
 
-    def _finalize(self, end_reason: PitchEndReason) -> Pitch | None:
-        valid, complete = self._validate(end_reason)
+    def _finalize(self, end_reason: PitchEndReason) -> tuple[Pitch | None, PitchDiscardReason | None]:
+        valid, complete, discard_reason = self._validate(end_reason)
         pts = [s for s in self._active if s.detected]
         if not valid:
             self.mode = PitchMode.IDLE
             self._active.clear()
             self._cooldown = self.config.cooldown_frames
-            return None
+            return None, discard_reason
         pitch = Pitch(
             pitch_id=str(uuid.uuid4()),
             start_frame=self._recording_start_frame,
@@ -345,7 +382,7 @@ class PitchStateMachine:
             start_reason=self._start_reason,
             end_reason=end_reason,
             samples=list(self._active),
-            backfill_frames=min(len(self._active), self.config.ring_buffer_frames),
+            backfill_frames=self._backfill_count,
             gap_count=self._total_gaps,
             reconnect_count=self._reconnects,
             valid=True,
@@ -355,7 +392,7 @@ class PitchStateMachine:
         self.mode = PitchMode.IDLE
         self._active.clear()
         self._cooldown = self.config.cooldown_frames
-        return pitch
+        return pitch, None
 
     def update(self, inp: PitchFrameInput) -> PitchUpdateResult:
         if self._cooldown > 0:
@@ -363,6 +400,7 @@ class PitchStateMachine:
 
         completed: Pitch | None = None
         discarded = False
+        discard_reason: PitchDiscardReason | None = None
 
         if inp.detected and inp.x_proc is not None and inp.y_proc is not None:
             in_release = self.geom.in_release_zone(
@@ -386,24 +424,28 @@ class PitchStateMachine:
                     else:
                         self._implausible_streak += 1
                         if self._implausible_streak >= self.config.max_implausible_frames:
-                            completed = self._finalize(PitchEndReason.INVALID_REACQUIRE)
+                            completed, discard_reason = self._finalize(
+                                PitchEndReason.INVALID_REACQUIRE
+                            )
                             discarded = completed is None
                             return PitchUpdateResult(
                                 mode=self.mode,
                                 pitch_completed=completed,
                                 pitch_discarded=discarded,
+                                discard_reason=discard_reason,
                             )
                 self._active.append(sample)
                 self._prev = sample
                 self._gap_frames = 0
                 end = self._check_end_while_recording()
                 if end is not None:
-                    completed = self._finalize(end)
+                    completed, discard_reason = self._finalize(end)
                     discarded = completed is None
                     return PitchUpdateResult(
                         mode=self.mode,
                         pitch_completed=completed,
                         pitch_discarded=discarded,
+                        discard_reason=discard_reason,
                     )
 
             self._was_in_release = in_release
@@ -417,14 +459,20 @@ class PitchStateMachine:
                 if pts and self._in_approach_zone(pts[-1].x_proc):
                     end = self._check_end_while_recording()
                     if end == PitchEndReason.TRACK_LOST_TERMINAL:
-                        completed = self._finalize(end)
+                        completed, discard_reason = self._finalize(end)
                         discarded = completed is None
                         return PitchUpdateResult(
                             mode=self.mode,
                             pitch_completed=completed,
                             pitch_discarded=discarded,
+                            discard_reason=discard_reason,
                         )
                 if self._gap_frames > self.config.max_gap_frames:
                     pass  # stay recording; validation may reject later
 
-        return PitchUpdateResult(mode=self.mode, pitch_completed=completed, pitch_discarded=discarded)
+        return PitchUpdateResult(
+            mode=self.mode,
+            pitch_completed=completed,
+            pitch_discarded=discarded,
+            discard_reason=discard_reason,
+        )
