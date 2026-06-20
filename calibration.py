@@ -13,6 +13,9 @@ import numpy as np
 Point = tuple[float, float]
 Polygon = tuple[Point, Point, Point, Point]
 
+# Default on-disk preset (JSON + {stem}_ignore.png sidecar).
+DEFAULT_PRESET_PATH = Path("configs/field.json")
+
 
 @dataclass(frozen=True)
 class FieldCalibration:

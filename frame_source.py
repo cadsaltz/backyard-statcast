@@ -69,7 +69,25 @@ class FileFrameSource(FrameSource):
     def is_live(self) -> bool:
         return False
 
+    @property
+    def frame_count(self) -> int | None:
+        n = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return n if n > 0 else None
+
+    @property
+    def frame_index(self) -> int:
+        return max(0, int(self._cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+
     def read(self) -> np.ndarray | None:
+        ok, frame = self._cap.read()
+        if ok:
+            return frame
+        return None
+
+    def seek(self, index: int) -> np.ndarray | None:
+        """Read frame at index (0-based). Returns None if out of range."""
+        index = max(0, index)
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, frame = self._cap.read()
         if ok:
             return frame

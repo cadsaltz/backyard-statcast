@@ -12,6 +12,7 @@ from calibration import FieldCalibration, Point, Polygon
 __all__ = [
     "Classification",
     "classify_point",
+    "ignore_mask_for_process",
     "is_ignored",
     "point_in_circle",
     "point_in_polygon",
@@ -91,15 +92,38 @@ def resize_ignore_mask(mask: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray
     return cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
+def ignore_mask_for_process(
+    cal: FieldCalibration,
+    frame_width: int,
+    frame_height: int,
+    process_scale: float,
+) -> np.ndarray:
+    """Scale calibration ignore mask to process-resolution for the runtime frame."""
+    mask = cal.ignore_mask
+    if (cal.frame_width, cal.frame_height) != (frame_width, frame_height):
+        mask = cv2.resize(
+            cal.ignore_mask,
+            (frame_width, frame_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    proc_w = max(1, int(frame_width * process_scale))
+    proc_h = max(1, int(frame_height * process_scale))
+    return resize_ignore_mask(mask, (proc_w, proc_h))
+
+
 def classify_point(
     pixel: tuple[int, int],
     cal: FieldCalibration,
     *,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
     ignore_mask: np.ndarray | None = None,
     ignore_check: bool = True,
 ) -> Classification:
+    fw = frame_width if frame_width is not None else cal.frame_width
+    fh = frame_height if frame_height is not None else cal.frame_height
     x, y = pixel
-    norm: Point = (x / cal.frame_width, y / cal.frame_height)
+    norm: Point = (x / fw, y / fh)
     ignored = is_ignored(pixel, cal, ignore_mask=ignore_mask) if ignore_check else False
     in_roi = False if ignored else point_in_polygon(norm, cal.roi)
     return Classification(
@@ -110,7 +134,7 @@ def classify_point(
             norm,
             cal.release_center,
             cal.release_radius,
-            frame_width=cal.frame_width,
-            frame_height=cal.frame_height,
+            frame_width=fw,
+            frame_height=fh,
         ),
     )

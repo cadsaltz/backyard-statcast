@@ -3,6 +3,7 @@ import numpy as np
 from calibration import FieldCalibration
 from spatial_filter import (
     classify_point,
+    ignore_mask_for_process,
     is_ignored,
     point_in_circle,
     point_in_polygon,
@@ -64,3 +65,15 @@ def test_scaled_polygons():
     roi_px = scaled_polygons(cal.roi, frame_width=200, frame_height=100)
     assert roi_px[0] == (0, 0)
     assert roi_px[2] == (200, 100)
+
+
+def test_classify_point_runtime_frame_size():
+    cal = _sample_cal()
+    cls = classify_point((100, 50), cal, frame_width=400, frame_height=200, ignore_check=False)
+    assert cls.in_roi is True
+
+
+def test_ignore_mask_for_process_scales_to_runtime():
+    cal = _sample_cal()
+    proc = ignore_mask_for_process(cal, frame_width=400, frame_height=200, process_scale=0.5)
+    assert proc.shape == (100, 200)

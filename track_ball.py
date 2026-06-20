@@ -15,19 +15,26 @@ from typing import Literal
 import cv2
 import numpy as np
 
-from calibration import FieldCalibration, load_calibration, save_calibration
+from calibration import (
+    DEFAULT_PRESET_PATH,
+    FieldCalibration,
+    load_calibration,
+    save_calibration,
+)
 from calibration_ui import run_calibration_ui
 from frame_source import open_frame_source
 from spatial_filter import (
     classify_point,
-    resize_ignore_mask,
+    ignore_mask_for_process,
     scale_point_to_pixels,
     scaled_polygons,
 )
+from track_state import TrackFrameInfo, TrackMode, TrackState
 
 WIN_LIVE = "Ball Tracker"
 WIN_FG = "Foreground"
 WIN_COLOR = "Color Filter"
+WIN_TRACK = "Track Window"
 
 ColorTarget = Literal["white", "yellow"]
 
@@ -40,6 +47,14 @@ PITCH_IDLE_FRAMES = 30
 
 
 @dataclass
+class PeakCandidate:
+    x: int
+    y: int
+    density_score: float
+    blob_area: float
+
+
+@dataclass
 class TrackResult:
     density_peak: tuple[int, int] | None  # full-frame coords
     density_peak_proc: tuple[int, int] | None = None  # process-resolution coords
@@ -47,6 +62,11 @@ class TrackResult:
     color_fg: np.ndarray | None = None
     rejected_by_ignore: bool = False
     raw_peak_proc: tuple[int, int] | None = None
+    track_mode: Literal["search", "track"] = "search"
+    coasting: bool = False
+    search_window_proc: tuple[int, int, int, int] | None = None
+    predicted_proc: tuple[int, int] | None = None
+    track_debug_proc: np.ndarray | None = None
 
 
 class BallTracker:
@@ -77,12 +97,14 @@ class BallTracker:
         self.yellow_min_sat = yellow_min_sat
         self.yellow_min_val = yellow_min_val
         self.ignore_mask_proc = ignore_mask_proc
+        self._roi_proc: np.ndarray | None = None
 
         self._bg: np.ndarray | None = None
         self._warmup_stack: list[np.ndarray] = []
         self._noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self._density_ksize = density_radius * 2 + 1
         self._proc_size: tuple[int, int] | None = None  # (w, h)
+        self._track = TrackState()
 
     @property
     def is_ready(self) -> bool:
@@ -97,9 +119,25 @@ class BallTracker:
         self._bg = None
         self._warmup_stack = []
         self._proc_size = None
+        self._track.reset()
 
     def set_ignore_mask_proc(self, mask: np.ndarray | None) -> None:
         self.ignore_mask_proc = mask
+
+    def set_roi_proc(self, polygon: list[tuple[int, int]] | None) -> None:
+        if polygon:
+            self._roi_proc = np.array(polygon, dtype=np.int32)
+            self._track.set_roi_gating(True)
+        else:
+            self._roi_proc = None
+            self._track.set_roi_gating(False)
+
+    def _in_roi_proc(self, px: int, py: int) -> bool:
+        if self._roi_proc is None:
+            return True
+        return (
+            cv2.pointPolygonTest(self._roi_proc, (float(px), float(py)), False) >= 0
+        )
 
     def _to_process(self, frame: np.ndarray) -> np.ndarray:
         if self.process_scale == 1.0:
@@ -125,33 +163,191 @@ class BallTracker:
         h, w = self._bg.shape[:2]
         self._proc_size = (w, h)
 
-    def _density_peak(self, color_mask: np.ndarray) -> tuple[int, int] | None:
+    def _density_peak(
+        self, color_mask: np.ndarray, radius: int | None = None
+    ) -> tuple[int, int, float] | None:
         if not cv2.countNonZero(color_mask):
             return None
-        ksize = self.density_radius * 2 + 1
-        # boxFilter counts neighbors — ~14x faster than float32 filter2D at 1080p.
+        r = self.density_radius if radius is None else radius
+        ksize = r * 2 + 1
         density = cv2.boxFilter(
             color_mask, cv2.CV_32F, (ksize, ksize), normalize=False
         )
-        _, _, _, max_loc = cv2.minMaxLoc(density)
-        return int(max_loc[0]), int(max_loc[1])
+        min_val, max_val, _, max_loc = cv2.minMaxLoc(density)
+        if max_val <= 0:
+            return None
+        return int(max_loc[0]), int(max_loc[1]), float(max_val)
 
-    def _color_mask(self, hsv: np.ndarray) -> np.ndarray:
+    def _density_at(
+        self, mask: np.ndarray, x: int, y: int, radius: int
+    ) -> float:
+        h, w = mask.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return 0.0
+        ksize = radius * 2 + 1
+        density = cv2.boxFilter(
+            mask, cv2.CV_32F, (ksize, ksize), normalize=False
+        )
+        return float(density[y, x])
+
+    def _track_peak(
+        self,
+        track_mask: np.ndarray,
+        radius: int,
+        anchor_proc: tuple[int, int] | None,
+        window_x0: int,
+        window_y0: int,
+        *,
+        min_contour_area: float = 1.0,
+    ) -> PeakCandidate | None:
+        if not cv2.countNonZero(track_mask):
+            return None
+
+        if anchor_proc is not None:
+            ax = anchor_proc[0] - window_x0
+            ay = anchor_proc[1] - window_y0
+            contours, _ = cv2.findContours(
+                track_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            best: PeakCandidate | None = None
+            best_dist = float("inf")
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < min_contour_area:
+                    continue
+                moments = cv2.moments(contour)
+                if moments["m00"] <= 0:
+                    continue
+                cx = int(moments["m10"] / moments["m00"])
+                cy = int(moments["m01"] / moments["m00"])
+                dist = (cx - ax) ** 2 + (cy - ay) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    score = self._density_at(track_mask, cx, cy, radius)
+                    best = PeakCandidate(cx, cy, score, float(area))
+            if best is not None:
+                return best
+
+        peak = self._density_peak(track_mask, radius)
+        if peak is None:
+            return None
+        lx, ly, score = peak
+        area = float(cv2.countNonZero(track_mask))
+        return PeakCandidate(lx, ly, score, area)
+
+    def _find_peak_in_mask(
+        self,
+        mask: np.ndarray,
+        *,
+        radius: int,
+        anchor_proc: tuple[int, int] | None,
+        offset_x: int = 0,
+        offset_y: int = 0,
+        min_contour_area: float = 1.0,
+    ) -> PeakCandidate | None:
+        peak = self._track_peak(
+            mask,
+            radius,
+            anchor_proc,
+            offset_x,
+            offset_y,
+            min_contour_area=min_contour_area,
+        )
+        if peak is None:
+            return None
+        return PeakCandidate(
+            peak.x + offset_x,
+            peak.y + offset_y,
+            peak.density_score,
+            peak.blob_area,
+        )
+
+    def _blob_area_at(
+        self,
+        mask: np.ndarray,
+        px: int,
+        py: int,
+        *,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> float:
+        lx, ly = px - offset_x, py - offset_y
+        h, w = mask.shape[:2]
+        if not (0 <= lx < w and 0 <= ly < h):
+            return 0.0
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for contour in contours:
+            if cv2.pointPolygonTest(contour, (float(lx), float(ly)), False) >= 0:
+                return float(cv2.contourArea(contour))
+        return 0.0
+
+    def _color_mask(self, hsv: np.ndarray, *, relax: bool = False) -> np.ndarray:
+        cfg = self._track.config
         if self.color_target == "yellow":
+            min_sat = self.yellow_min_sat
+            min_val = self.yellow_min_val
+            if relax:
+                min_sat = max(0, min_sat - cfg.track_yellow_sat_relax)
+                min_val = max(0, min_val - cfg.track_yellow_val_relax)
             return cv2.inRange(
                 hsv,
-                (self.yellow_hue_low, self.yellow_min_sat, self.yellow_min_val),
+                (self.yellow_hue_low, min_sat, min_val),
                 (self.yellow_hue_high, 255, 255),
             )
+        white = self.white_threshold
+        max_sat = self.max_saturation
+        if relax:
+            white = max(0, white - cfg.track_white_relax)
+            max_sat = min(255, max_sat + cfg.track_sat_relax)
         return cv2.inRange(
             hsv,
-            (0, 0, self.white_threshold),
-            (180, self.max_saturation, 255),
+            (0, 0, white),
+            (180, max_sat, 255),
         )
+
+    def _peak_rejected_by_ignore(self, px: int, py: int) -> bool:
+        if self.ignore_mask_proc is None:
+            return False
+        h, w = self.ignore_mask_proc.shape[:2]
+        return 0 <= px < w and 0 <= py < h and self.ignore_mask_proc[py, px] > 0
 
     def toggle_color_target(self) -> ColorTarget:
         self.color_target = "yellow" if self.color_target == "white" else "white"
         return self.color_target
+
+    def _search_candidate(
+        self,
+        color_mask: np.ndarray,
+        track: TrackState,
+        proc_w: int,
+        proc_h: int,
+    ) -> PeakCandidate | None:
+        prior = track.search_prior
+        if prior is not None:
+            prior_win = track.prior_search_window(proc_w, proc_h)
+            if prior_win is not None:
+                px0, py0, px1, py1 = prior_win
+                prior_crop = color_mask[py0:py1, px0:px1]
+                candidate = self._find_peak_in_mask(
+                    prior_crop,
+                    radius=self.density_radius,
+                    anchor_proc=prior,
+                    offset_x=px0,
+                    offset_y=py0,
+                    min_contour_area=track.config.min_lock_area,
+                )
+                if candidate is not None:
+                    return candidate
+        peak = self._density_peak(color_mask)
+        if peak is None:
+            return None
+        px, py, score = peak
+        blob_area = self._blob_area_at(color_mask, px, py)
+        if blob_area < track.config.min_lock_area:
+            blob_area = float(score)
+        return PeakCandidate(px, py, score, blob_area)
 
     def process(self, frame: np.ndarray, *, debug: bool = False) -> TrackResult | None:
         small = self._to_process(frame)
@@ -173,22 +369,114 @@ class BallTracker:
         color_mask = self._color_mask(hsv)
         color_mask = cv2.bitwise_and(color_mask, fg_mask)
 
-        peak_small = self._density_peak(color_mask)
-        raw_peak_small = peak_small
+        proc_w, proc_h = self._proc_size
+        track = self._track
+        info = track.frame_info(proc_w, proc_h)
+        raw_peak_small: tuple[int, int] | None = None
+        peak_small: tuple[int, int] | None = None
         rejected = False
-        if peak_small and self.ignore_mask_proc is not None:
-            px, py = peak_small
-            h, w = self.ignore_mask_proc.shape[:2]
-            if 0 <= px < w and 0 <= py < h and self.ignore_mask_proc[py, px] > 0:
-                peak_small = None
-                rejected = True
+        coasting = info.coasting
+
+        if track.mode == TrackMode.SEARCH:
+            candidate = self._search_candidate(
+                color_mask, track, proc_w, proc_h
+            )
+            if candidate is not None:
+                px, py = candidate.x, candidate.y
+                raw_peak_small = (px, py)
+                if self._peak_rejected_by_ignore(px, py):
+                    rejected = True
+                    track.search_miss()
+                else:
+                    in_roi = self._in_roi_proc(px, py)
+                    track.register_search_hit(
+                        px,
+                        py,
+                        candidate.density_score,
+                        candidate.blob_area,
+                        in_roi=in_roi,
+                        has_motion=True,
+                    )
+                    peak_small = (px, py)
+            else:
+                track.search_miss()
+        else:
+            last = track.last_position()
+            x0, y0, x1, y1 = info.search_window_proc or (0, 0, proc_w, proc_h)
+            hsv_crop = hsv[y0:y1, x0:x1]
+            cfg = track.config
+            color_relaxed = self._color_mask(hsv_crop, relax=True)
+            slow_in_roi = (
+                track.is_slow_motion()
+                and last is not None
+                and self._in_roi_proc(last[0], last[1])
+            )
+            if slow_in_roi:
+                track_mask = color_relaxed
+            else:
+                diff_crop = diff_max[y0:y1, x0:x1]
+                diff_thresh = max(0, self.diff_threshold - cfg.track_diff_relax)
+                _, fg_relaxed = cv2.threshold(
+                    diff_crop, diff_thresh, 255, cv2.THRESH_BINARY
+                )
+                track_mask = cv2.bitwise_and(color_relaxed, fg_relaxed.astype(np.uint8))
+            candidate = self._find_peak_in_mask(
+                track_mask,
+                radius=cfg.track_density_radius,
+                anchor_proc=last,
+                offset_x=x0,
+                offset_y=y0,
+                min_contour_area=cfg.min_track_area,
+            )
+            accepted = False
+            if candidate is not None:
+                px, py = candidate.x, candidate.y
+                raw_peak_small = (px, py)
+                in_roi = self._in_roi_proc(px, py)
+                if track.qualify_track_peak(
+                    px,
+                    py,
+                    candidate.density_score,
+                    candidate.blob_area,
+                    in_roi=in_roi,
+                ):
+                    if self._peak_rejected_by_ignore(px, py):
+                        rejected = True
+                    else:
+                        track.accept_track_peak(px, py, candidate.density_score)
+                        track.update_track_health(
+                            in_roi=in_roi, blob_area=candidate.blob_area
+                        )
+                        peak_small = (px, py)
+                        accepted = True
+            if not accepted:
+                coast_pos = track.track_miss()
+                if coast_pos is not None:
+                    peak_small = coast_pos
+                    coasting = track.is_coasting
+                    in_roi = self._in_roi_proc(coast_pos[0], coast_pos[1])
+                    track.update_track_health(
+                        in_roi=in_roi, blob_area=cfg.min_track_area
+                    )
+                info = track.frame_info(proc_w, proc_h)
+
         peak_full = self._to_full(*peak_small) if peak_small else None
 
         foreground = None
         color_fg = None
+        track_debug_proc = None
         if debug:
             foreground = cv2.bitwise_and(small, small, mask=fg_mask)
             color_fg = cv2.bitwise_and(small, small, mask=color_mask)
+            track_debug_proc = draw_track_debug_panel(
+                color_mask,
+                info,
+                raw_peak_small,
+            )
+
+        mode_label: Literal["search", "track"] = (
+            "search" if track.mode == TrackMode.SEARCH else "track"
+        )
 
         return TrackResult(
             density_peak=peak_full,
@@ -197,6 +485,11 @@ class BallTracker:
             color_fg=color_fg,
             rejected_by_ignore=rejected,
             raw_peak_proc=raw_peak_small,
+            track_mode=mode_label,
+            coasting=coasting,
+            search_window_proc=info.search_window_proc,
+            predicted_proc=info.predicted_proc,
+            track_debug_proc=track_debug_proc,
         )
 
 
@@ -245,13 +538,18 @@ def parse_args():
         "--calibration",
         type=Path,
         default=None,
-        help="Load saved calibration JSON (skip interactive UI).",
+        help=f"Load saved preset JSON (default: {DEFAULT_PRESET_PATH} if it exists).",
     )
     p.add_argument(
         "--save-calibration",
         type=Path,
         default=None,
-        help="Save calibration to this JSON path after interactive setup.",
+        help="Save preset to this path after interactive calibration.",
+    )
+    p.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Run interactive calibration and overwrite the saved preset.",
     )
     p.add_argument(
         "--skip-calibration",
@@ -259,6 +557,31 @@ def parse_args():
         help="Run without spatial calibration (legacy behavior).",
     )
     return p.parse_args()
+
+
+def resolve_field_calibration(
+    args: argparse.Namespace,
+    frame_source,
+) -> FieldCalibration | None:
+    """Load a saved preset, or run the calibration UI and save for next time."""
+    if args.skip_calibration:
+        return None
+
+    load_path = args.calibration or DEFAULT_PRESET_PATH
+    save_path = args.save_calibration or load_path
+
+    if args.recalibrate or not load_path.is_file():
+        cal = run_calibration_ui(frame_source, live=frame_source.is_live)
+        if cal is None:
+            frame_source.release()
+            raise SystemExit("Calibration cancelled.")
+        save_calibration(cal, save_path)
+        print(f"Saved field preset to {save_path} (+ {save_path.stem}_ignore.png)")
+        return cal
+
+    cal = load_calibration(load_path)
+    print(f"Loaded field preset from {load_path}  (--recalibrate to redraw)")
+    return cal
 
 
 def color_window_title(target: ColorTarget) -> str:
@@ -277,6 +600,59 @@ def draw_color_panel_label(img: np.ndarray, target: ColorTarget) -> None:
         (0, 255, 255),
         2,
     )
+
+
+def draw_track_debug_panel(
+    color_mask: np.ndarray,
+    info: TrackFrameInfo,
+    raw_peak_proc: tuple[int, int] | None,
+) -> np.ndarray:
+    panel = cv2.cvtColor(color_mask, cv2.COLOR_GRAY2BGR)
+    panel = (panel // 3).astype(np.uint8)
+
+    if info.search_window_proc is not None:
+        x0, y0, x1, y1 = info.search_window_proc
+        cv2.rectangle(panel, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), (255, 255, 0), 1)
+
+    if info.prev_proc is not None and info.last_proc is not None:
+        cv2.arrowedLine(
+            panel,
+            info.prev_proc,
+            info.last_proc,
+            (255, 255, 255),
+            1,
+            tipLength=0.3,
+        )
+
+    if info.last_proc is not None:
+        cv2.circle(panel, info.last_proc, 4, (0, 255, 255), -1)
+
+    if info.predicted_proc is not None:
+        cv2.circle(panel, info.predicted_proc, 4, (255, 0, 255), -1)
+
+    if raw_peak_proc is not None:
+        cv2.circle(panel, raw_peak_proc, 4, (0, 0, 255), -1)
+
+    if info.coasting:
+        label = "COAST"
+    elif info.mode == TrackMode.SEARCH and info.last_proc is not None:
+        label = "SEARCH+PRIOR"
+    elif info.mode == TrackMode.TRACK and info.slow_motion:
+        label = f"TRACK-SLOW pad+{info.extra_pad}"
+    elif info.mode == TrackMode.TRACK:
+        label = f"TRACK pad+{info.extra_pad}"
+    else:
+        label = info.mode.name
+    cv2.putText(
+        panel,
+        label,
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        2,
+    )
+    return panel
 
 
 def draw_calibration_overlay(frame: np.ndarray, cal: FieldCalibration) -> None:
@@ -299,8 +675,8 @@ def draw_calibration_overlay(frame: np.ndarray, cal: FieldCalibration) -> None:
         if mask_full.shape[:2] != (h, w):
             mask_full = cv2.resize(mask_full, (w, h), interpolation=cv2.INTER_NEAREST)
         tint = frame.copy()
-        tint[mask_full > 0] = (40, 40, 40)
-        cv2.addWeighted(tint, 0.35, frame, 0.65, 0, frame)
+        tint[mask_full > 0] = (0, 0, 255)
+        cv2.addWeighted(tint, 0.4, frame, 0.6, 0, frame)
 
 
 def draw_track_dot(
@@ -337,23 +713,7 @@ def main():
             source_str, preset["width"], preset["height"]
         )
 
-    cal: FieldCalibration | None = None
-    if args.skip_calibration:
-        cal = None
-    elif args.calibration is not None:
-        cal = load_calibration(args.calibration)
-    else:
-        first = frame_source.read()
-        if first is None:
-            frame_source.release()
-            raise SystemExit("Could not read first frame for calibration.")
-        cal = run_calibration_ui(first)
-        if cal is None:
-            frame_source.release()
-            raise SystemExit("Calibration cancelled.")
-        if args.save_calibration is not None:
-            save_calibration(cal, args.save_calibration)
-            print(f"Saved calibration to {args.save_calibration}")
+    cal: FieldCalibration | None = resolve_field_calibration(args, frame_source)
 
     tracker = BallTracker(
         process_scale=process_scale,
@@ -364,18 +724,14 @@ def main():
         color_target=args.color,
     )
 
-    if cal is not None:
-        proc_h = int(cal.frame_height * process_scale)
-        proc_w = int(cal.frame_width * process_scale)
-        ignore_proc = resize_ignore_mask(cal.ignore_mask, (proc_w, proc_h))
-        tracker.set_ignore_mask_proc(ignore_proc)
-
     show_debug = not args.no_debug
     frame_count = 0
     t0 = time.perf_counter()
     size_warned = False
     pitch_active = False
     idle_frames = 0
+    ignore_mask_ready = cal is None
+    roi_mask_ready = cal is None
 
     if is_file:
         live_w, live_h = 960, 540
@@ -386,6 +742,7 @@ def main():
     if show_debug:
         open_window(WIN_FG, dbg_w, dbg_h, 80, live_h + 100)
         open_window(WIN_COLOR, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+        open_window(WIN_TRACK, dbg_w, dbg_h, dbg_w * 2 + 120, live_h + 100)
         cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
 
     print("Calibration: 1=ROI 2=Ignore 3=Strike 4=Release  Enter=start")
@@ -424,13 +781,38 @@ def main():
                 )
             size_warned = True
 
+        frame_h, frame_w = frame.shape[:2]
+        if cal is not None and not ignore_mask_ready:
+            tracker.set_ignore_mask_proc(
+                ignore_mask_for_process(cal, frame_w, frame_h, process_scale)
+            )
+            ignore_mask_ready = True
+
+        if cal is not None and not roi_mask_ready:
+            proc_w = max(1, int(frame_w * process_scale))
+            proc_h = max(1, int(frame_h * process_scale))
+            tracker.set_roi_proc(
+                scaled_polygons(
+                    cal.roi,
+                    frame_width=proc_w,
+                    frame_height=proc_h,
+                )
+            )
+            roi_mask_ready = True
+
         result = tracker.process(frame, debug=show_debug)
 
         detection = result.density_peak if result else None
         if detection:
             idle_frames = 0
             if cal is not None:
-                cls = classify_point(detection, cal)
+                cls = classify_point(
+                    detection,
+                    cal,
+                    frame_width=frame_w,
+                    frame_height=frame_h,
+                    ignore_check=False,
+                )
                 if cls.in_roi:
                     pitch_active = True
         else:
@@ -453,10 +835,15 @@ def main():
         if not tracker.is_ready:
             n, total = tracker.warmup_progress
             status += f"  learning bg {n}/{total}"
-        elif result and result.density_peak:
+        elif result:
+            if result.coasting:
+                status += "  mode=COAST"
+            else:
+                status += f"  mode={result.track_mode.upper()}"
+        if result and result.density_peak:
             x, y = result.density_peak
             status += f"  ball=({x},{y})"
-        else:
+        elif tracker.is_ready:
             status += "  no ball"
         if pitch_active:
             status += "  PITCH"
@@ -476,6 +863,8 @@ def main():
             draw_track_dot(color_view, result.density_peak_proc, pitch_active=pitch_active)
             draw_color_panel_label(color_view, tracker.color_target)
             cv2.imshow(WIN_COLOR, color_view)
+            if result.track_debug_proc is not None:
+                cv2.imshow(WIN_TRACK, result.track_debug_proc)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -492,10 +881,12 @@ def main():
             if show_debug:
                 open_window(WIN_FG, dbg_w, dbg_h, 80, live_h + 100)
                 open_window(WIN_COLOR, dbg_w, dbg_h, dbg_w + 100, live_h + 100)
+                open_window(WIN_TRACK, dbg_w, dbg_h, dbg_w * 2 + 120, live_h + 100)
                 cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
             else:
                 cv2.destroyWindow(WIN_FG)
                 cv2.destroyWindow(WIN_COLOR)
+                cv2.destroyWindow(WIN_TRACK)
         if key in (ord("+"), ord("=")):
             tracker.diff_threshold = min(100, tracker.diff_threshold + 3)
         if key == ord("-"):

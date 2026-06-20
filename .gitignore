@@ -5,4 +5,8 @@ __pycache__/
 *.log
 models/
 
+# Per-field calibration presets (camera-specific; regenerate with --recalibrate)
+configs/field.json
+configs/field_ignore.png
+
 videos/

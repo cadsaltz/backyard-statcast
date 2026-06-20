@@ -2,7 +2,7 @@
 
 Live GoPro HERO10 video feed on Linux for a backyard pitch-tracking project.
 
-Ball tracking is not implemented yet. This repo currently only gets a live camera feed into Python/OpenCV.
+Ball tracking runs via `track_ball.py` on a live GoPro feed or recorded video, with optional spatial calibration to filter background noise.
 
 ## Prerequisites
 
@@ -100,15 +100,25 @@ Before tracking, the first frame freezes so you can define:
 
 Keys during calibration: `1`–`4` switch mode, `[`/`]` brush size, `Enter` start, `q` quit.
 
+- **Live feed:** video keeps rolling while you draw; tracking starts when you press Enter.
+- **Recorded video:** frozen frame; `,`/`.` or arrow keys scrub to pick a frame (ignore paint clears on scrub).
+
+### Presets (save once, reuse every run)
+
+The first time you calibrate, regions are saved automatically to `configs/field.json` (+ `configs/field_ignore.png`). On later runs, `./run_tracker.sh` loads that preset and skips the UI.
+
 ```bash
-# Interactive calibration, save for reuse
-python track_ball.py --source /dev/video42 --save-calibration configs/field.json
+# Normal — loads configs/field.json if it exists, otherwise opens calibration UI
+./run_tracker.sh
 
-# Reuse saved calibration
-python track_ball.py --source /dev/video42 --calibration configs/field.json
+# Redraw regions and overwrite the preset
+./run_tracker.sh --recalibrate
 
-# Legacy: no spatial filtering
-python track_ball.py --source /dev/video42 --skip-calibration
+# Use a named preset file
+python track_ball.py --source /dev/video42 --calibration configs/backyard.json --save-calibration configs/backyard.json
+
+# Tracking without spatial filtering
+./run_tracker.sh --skip-calibration
 ```
 
 Yellow dot = tracker validation (Choice B). Red dot = detection inside ROI (`pitch_active`).
