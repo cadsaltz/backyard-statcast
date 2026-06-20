@@ -121,7 +121,18 @@ python track_ball.py --source /dev/video42 --calibration configs/backyard.json -
 ./run_tracker.sh --skip-calibration
 ```
 
-Yellow dot = tracker validation (Choice B). Red dot = detection inside ROI (`pitch_active`).
+Yellow dot = tracker validation (Choice B). Red dot = pitch recording.
+
+## Pitch detection
+
+When calibration is loaded, the tracker runs a pitch state machine alongside Search/Track mode:
+
+- **Recording** starts within 1–2 frames of release-like motion in the release zone (strong rightward vs vertical motion).
+- A **cyan flight path** is drawn live during recording (confirms data is being collected).
+- When the pitch ends (impact, plate crossing, or track loss near the zone), the path **fades out over ~4 seconds** so the next pitch has a clean view.
+- Pitch analytics (velocity, break, fit) are not run live; completed pitches are validated and logged to the console in v1.
+
+Status line: `PITCH` while recording, `idle` otherwise.
 
 ## How the pieces relate
 

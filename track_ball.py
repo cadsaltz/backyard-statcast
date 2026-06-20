@@ -29,6 +29,9 @@ from spatial_filter import (
     scale_point_to_pixels,
     scaled_polygons,
 )
+from pitch_geometry import build_field_geometry
+from pitch_state import PitchFrameInput, PitchMode, PitchStateMachine
+from pitch_tracer import PitchTracer
 from track_state import TrackFrameInfo, TrackMode, TrackState
 
 WIN_LIVE = "Ball Tracker"
@@ -42,9 +45,6 @@ RESOLUTION_PRESETS = {
     "1080": {"width": 1920, "height": 1080, "process_scale": 0.5, "live_win": (960, 540)},
     "720": {"width": 1280, "height": 720, "process_scale": 1.0, "live_win": (640, 360)},
 }
-
-PITCH_IDLE_FRAMES = 30
-
 
 @dataclass
 class PeakCandidate:
@@ -728,8 +728,9 @@ def main():
     frame_count = 0
     t0 = time.perf_counter()
     size_warned = False
-    pitch_active = False
-    idle_frames = 0
+    pitch_machine: PitchStateMachine | None = None
+    pitch_tracer: PitchTracer | None = None
+    field_geom = None
     ignore_mask_ready = cal is None
     roi_mask_ready = cal is None
 
@@ -746,7 +747,7 @@ def main():
         cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
 
     print("Calibration: 1=ROI 2=Ignore 3=Strike 4=Release  Enter=start")
-    print("Yellow dot = tracking validation  Red dot = pitch active (inside ROI)")
+    print("Yellow dot = tracking validation  Red dot = pitch recording")
     print(
         "Keys: b=relearn  c=white/yellow  d=debug panels  +/-=bg  "
         "9/0=brightness  [/]=sat  ,/.=density  q=quit"
@@ -800,26 +801,65 @@ def main():
             )
             roi_mask_ready = True
 
+        if cal is not None and pitch_machine is None:
+            field_geom = build_field_geometry(
+                cal,
+                frame_width=frame_w,
+                frame_height=frame_h,
+                process_scale=process_scale,
+            )
+            pitch_machine = PitchStateMachine(field_geom)
+            pitch_tracer = PitchTracer(fade_sec=pitch_machine.config.tracer_fade_sec)
+
         result = tracker.process(frame, debug=show_debug)
 
         detection = result.density_peak if result else None
-        if detection:
-            idle_frames = 0
-            if cal is not None:
+        pitch_recording = False
+        now = elapsed
+
+        if pitch_machine is not None and pitch_tracer is not None and result is not None:
+            proc_pt = result.density_peak_proc
+            full_pt = result.density_peak
+            detected = proc_pt is not None and not result.rejected_by_ignore
+            cls = None
+            if detected and cal is not None and full_pt is not None:
                 cls = classify_point(
-                    detection,
+                    full_pt,
                     cal,
                     frame_width=frame_w,
                     frame_height=frame_h,
                     ignore_check=False,
                 )
-                if cls.in_roi:
-                    pitch_active = True
-        else:
-            idle_frames += 1
-            if idle_frames >= PITCH_IDLE_FRAMES:
-                pitch_active = False
-                idle_frames = 0
+            inp = PitchFrameInput(
+                frame_index=frame_count,
+                timestamp_sec=elapsed,
+                x_proc=proc_pt[0] if proc_pt else None,
+                y_proc=proc_pt[1] if proc_pt else None,
+                detected=detected,
+                track_mode=TrackMode.TRACK if result.track_mode == "track" else TrackMode.SEARCH,
+                coasting=result.coasting,
+                in_roi=cls.in_roi if cls else False,
+                in_release_zone=cls.in_release_zone if cls else False,
+                in_strike_zone=cls.in_strike_zone if cls else False,
+            )
+            update_result = pitch_machine.update(inp)
+            pitch_recording = pitch_machine.mode == PitchMode.RECORDING
+
+            if pitch_recording:
+                pitch_tracer.sync_from_samples(pitch_machine.active_samples)
+
+            if update_result.pitch_completed is not None:
+                pitch = update_result.pitch_completed
+                pitch_tracer.finalize_path(now=now, valid=pitch.valid)
+                print(
+                    f"Pitch saved id={pitch.pitch_id[:8]} "
+                    f"samples={len(pitch.samples)} "
+                    f"complete={pitch.complete} "
+                    f"end={pitch.end_reason.value}"
+                )
+            elif update_result.pitch_discarded:
+                pitch_tracer.finalize_path(now=now, valid=False)
+                print("Pitch discarded")
 
         if is_file:
             status = (
@@ -845,22 +885,26 @@ def main():
             status += f"  ball=({x},{y})"
         elif tracker.is_ready:
             status += "  no ball"
-        if pitch_active:
+        if pitch_recording:
             status += "  PITCH"
+        elif pitch_machine is not None and pitch_machine._cooldown > 0:
+            status += "  cooldown"
         else:
-            status += "  track"
+            status += "  idle"
 
         cv2.putText(frame, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
         if cal is not None:
             draw_calibration_overlay(frame, cal)
-        draw_track_dot(frame, detection, pitch_active=pitch_active)
+        if pitch_tracer is not None:
+            pitch_tracer.draw(frame, now)
+        draw_track_dot(frame, detection, pitch_active=pitch_recording)
 
         cv2.imshow(WIN_LIVE, frame)
 
         if show_debug and result and result.foreground is not None:
             cv2.imshow(WIN_FG, result.foreground)
             color_view = result.color_fg.copy()
-            draw_track_dot(color_view, result.density_peak_proc, pitch_active=pitch_active)
+            draw_track_dot(color_view, result.density_peak_proc, pitch_active=pitch_recording)
             draw_color_panel_label(color_view, tracker.color_target)
             cv2.imshow(WIN_COLOR, color_view)
             if result.track_debug_proc is not None:
@@ -871,8 +915,10 @@ def main():
             break
         if key == ord("b"):
             tracker.reset()
-            pitch_active = False
-            idle_frames = 0
+            if pitch_machine is not None:
+                pitch_machine.reset()
+            if pitch_tracer is not None:
+                pitch_tracer.abort_live()
         if key == ord("c"):
             tracker.toggle_color_target()
             cv2.setWindowTitle(WIN_COLOR, color_window_title(tracker.color_target))
